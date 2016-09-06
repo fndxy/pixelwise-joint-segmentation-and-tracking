@@ -1,0 +1,132 @@
+function [phi,TrackRes,j]=registration_JRACS(RGB,I,noFrame,epislon_reg,fore_hist,back_hist,phi,iter_num,nBin,saveTrackBmp,...
+    lamda_registration,backgroundRatio,thresh_delta_T,backgroundCurve)
+% *************************************************************************
+% Function：get registration result, i.e, estimate the affine transformation result
+% Parameters:
+%   RGB：tracked frame;
+%   I：
+%   noFrame:frame number
+%   epislon_reg：
+%   fore_hist：
+%   back_hist：
+%   phi：level set
+%   iter_num: max iteration number
+%   nBin：
+%   saveTrackBmp：saving tracking result 1:yes 0:no
+%   lamda_registration：weights to adjust foreground and background information
+%   curMode：mode to call get_wfbx_JRACS
+%   backgroundRatio: 0-1: the size of background size 
+%   thresh_delta_T: convergence threshold of registration step
+%   backgroundCurve: 1: draw backgrounnd curve  0: not
+% Return：
+%   phi：level set of registration result
+%   TrackRes: registration result
+%   j: iteration number of registration segmentation
+% -------------------------------------------
+% *************************************************************************
+
+old_delta_T=zeros(6,1);  % 
+
+flag=0;   % flag variable whether algorithm is convergence. 1: convergenced 0: no
+set(gcf,'DoubleBuffer','on');               % set DoubleBuffer
+for j=1:iter_num
+    % get foreground and background histogram of current frame   
+    [fore_hist,back_hist,WF,WB,ind_x,ind_y,uv,border]=get_fore_back_hist_JRACS(I,phi,nBin,1,backgroundRatio);
+    row = ind_x;
+    col = ind_y;
+%     求解 P（yi|Mf） P(yi|Mb)in article
+    [PMf,PMb] = caculate_P(I,fore_hist,back_hist,ind_x,ind_y,nBin);
+    [nf,nb,~] = caculate_n(phi,ind_x,ind_y,1);
+    
+    % 根据贝叶斯公式 求P(Mf|yi) P(Mb|yi) according to article
+    n = nf+nb;
+    PMB = nb/n;
+    PMF = nf/n;
+    PMbB = PMb*PMB./(PMb*PMB+PMf*PMF);
+    PMbF = PMf*PMF./(PMb*PMB+PMf*PMF);
+    %求P(xi|phi,p,Mf) p(xi|phi,p,Mb)
+    H = Heaviside(phi,1,ind_x,ind_y);
+    PxMf = H/nf;
+    PxMb = (1-H)/nb;
+    %求P（xi|phi,p,yi） 
+    size(PxMf)
+    size(PMbF)
+    Pxpyf = PxMf.*PMbF';
+    Pxpyb = PxMb.*PMbB';
+    
+    sum(Pxpyf+Pxpyb);
+    
+    % 计算p(xi|phi,p,yi)
+    Pf = PMf./(nf*PMf+nb*PMb);
+    Pb = PMb./(nf*PMf+nb*PMb);
+    pxphipy = H.*(PMf./(nf*PMf+nb*PMb))' + (1-H).*(PMb./(nf*PMf+nb*PMb))';
+    sum(pxphipy);
+    
+    pxphipy = pxphipy/(sum(pxphipy));    
+    H= Heaviside(phi,epislon_reg,row,col);    % calculate the heaviside function H (refer to fig.2)   
+    Delta_h = Delta(phi,epislon_reg,row,col); % the first term of right hand in the Eq.(20)
+    gra =get_gradv(phi,col,row); % calculate the second term of the right hand in the Eq.(20)
+       
+%     [Wfx,Wbx]=get_wfbx_JRACS(I,phi,row,col,WF,WB,fore_hist,fore_hist_n,back_hist,back_hist_n,H,nBin,lamda_registration);
+    dwdp_v=get_dwdp_v(col,row);  % calculate the third term of the right hand in the  Eq.(20)   
+
+    J= get_J(Delta_h,gra,dwdp_v); % calculate J in the Eq.(20)  
+
+    fir_term = eps*ones(6,6);
+    for s1 = 1:size(J,1)
+%         term1 = 0.5*(Wfx(s1)/(H(s1)+eps)+Wbx(s1)/(1-H(s1)+eps));
+        term1 = 0.5*(1/pxphipy(s1)*(Pf(s1)/(H(s1)+eps)+Pb(s1)/(1-H(s1)+eps)));
+        termj = J(s1,:);
+        fir_term = fir_term + term1*termj'*termj;
+    end
+    sec_term = zeros(6,1);
+    for s1 = 1:size(J,1)
+        sec_term = sec_term + (Pf(s1)-Pb(s1))/(pxphipy(s1))*J(s1,:)';
+    end
+    % delta_T is the registration matrix used to estimate the affine transformation of the target
+     
+    
+    delta_T=-(fir_term)\(sec_term+eps);
+
+    % The algorithm convergence while the |delta_T0|<thresh_delta_T
+    conv_delta_T=norm(delta_T); 
+%     b = delta_T./old_delta_T
+    if (conv_delta_T<thresh_delta_T*0.3)
+        flag=1;
+    else
+        old_delta_T=delta_T;
+    end;
+    
+    delta_T = reshape(delta_T, 2, 3)  
+    % update the level set in the narrowband  
+    [row,col] = find(phi>=-3*border);
+    uv_new=[col,row];
+    
+    % updated target contour by estimated affine matrix
+    [phi,uv]=update_phi2(phi,delta_T,uv_new,border);  
+    
+    TrackRes=makeTrackingRes(RGB,phi,border,1);
+    imshow(TrackRes);
+    title(strcat(num2str(noFrame),':registration:',num2str(j),'/',num2str(iter_num)));drawnow;
+    
+    if ((j==iter_num | flag==1) & saveTrackBmp==1)        % save final registration result                               
+        TrackRes=makeTrackingRes(RGB,phi,border,backgroundCurve);
+        tt1=getprefix(noFrame,10,100);                    % 
+        tt2=getprefix(j,0,100);                           % 
+        imwrite(TrackRes,['.\registration and segmentation\','_im',tt1,num2str(noFrame),'_reg_',tt2,num2str(j),'.jpg']);
+    end
+    hold off; 
+    
+    % the level set is free re-initialization
+    for i=1:2
+       phi=phi+0.2*4*del2(phi);
+    end
+    
+    if (flag==1)
+        break;
+    end
+end
+Mask=zeros(size(phi));
+Mask(phi>=0)=1;
+phi = -mask2phi(Mask);
+phi=reg_levelset(phi);
